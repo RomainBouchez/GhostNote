@@ -135,12 +135,19 @@ export default function RotatingEarth({
             context.globalAlpha = alpha
             context.stroke()
 
-            // Halftone dots
+            // Halftone dots — faded by depth so the ones curving toward the rim
+            // (facing away from the camera) sit back, giving the sphere volume.
             const dotR = Math.max(0.6, 1 * strokeScale)
+            const rot = projection.rotate()
+            const viewCenter: Coord = [-rot[0], -rot[1]]
             context.fillStyle = "#000000"
             allDots.forEach((dot) => {
                 const projected = projection(dot)
                 if (projected) {
+                    // facing = 1 dead-centre, → 0 at the limb.
+                    const facing = Math.cos(d3.geoDistance(dot, viewCenter))
+                    if (facing <= 0) return
+                    context.globalAlpha = alpha * (0.12 + 0.88 * Math.pow(facing, 1.5))
                     context.beginPath()
                     context.arc(projected[0], projected[1], dotR, 0, 2 * Math.PI)
                     context.fill()

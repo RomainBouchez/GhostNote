@@ -14,7 +14,6 @@ export function Footer() {
                 <div className="flex flex-col gap-8 md:flex-row md:items-start md:justify-between">
                     <div className="max-w-sm space-y-3">
                         <div className="flex items-center gap-2 font-mono text-sm font-semibold text-black">
-                            <span aria-hidden="true">👻</span>
                             <span>Ghost Note</span>
                         </div>
                         <p className="text-sm text-gray-500">{t.footer.tagline}</p>

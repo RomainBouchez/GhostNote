@@ -30,7 +30,6 @@ export function Header() {
                     href="/"
                     className="flex items-center gap-2 font-mono text-sm font-semibold tracking-tight text-black rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-black/60"
                 >
-                    <span aria-hidden="true">👻</span>
                     <span>Ghost Note</span>
                 </Link>
 

@@ -8,10 +8,11 @@ import { ScrambleText } from "./scramble-text";
 interface StepPanelProps {
     step: StepCopy;
     align: "left" | "right";
+    vAlign?: "top" | "bottom";
     accent?: boolean;
 }
 
-export function StepPanel({ step, align, accent = false }: StepPanelProps) {
+export function StepPanel({ step, align, vAlign = "top", accent = false }: StepPanelProps) {
     const ref = useRef<HTMLDivElement>(null);
     const [active, setActive] = useState(false);
 
@@ -20,8 +21,8 @@ export function StepPanel({ step, align, accent = false }: StepPanelProps) {
         offset: ["start end", "end start"],
     });
 
-    // Fade + drift as the panel crosses the viewport centre.
-    const opacity = useTransform(scrollYProgress, [0.1, 0.32, 0.68, 0.9], [0, 1, 1, 0]);
+    // Fade in as the panel enters, then hold opaque — never fade back out on exit.
+    const opacity = useTransform(scrollYProgress, [0.1, 0.32], [0, 1]);
     const y = useTransform(scrollYProgress, [0.1, 0.4, 0.6, 0.9], [40, 0, 0, -40]);
 
     useMotionValueEvent(scrollYProgress, "change", (v) => {
@@ -32,8 +33,16 @@ export function StepPanel({ step, align, accent = false }: StepPanelProps) {
     return (
         <section
             ref={ref}
-            className="relative flex min-h-screen items-center px-6 sm:px-10"
+            className="relative flex min-h-screen flex-col px-6 sm:px-10"
         >
+            {/* Each card lives in one half of the section so it can never cross
+                the vertical centre where the globe's focus point sits. Top cards
+                bottom-align in the upper half; bottom cards top-align in the lower. */}
+            <div
+                className={`mx-auto flex h-[50vh] w-full max-w-7xl ${
+                    vAlign === "top" ? "items-end pb-4" : "mt-auto items-center"
+                }`}
+            >
             <motion.div
                 style={{ opacity, y }}
                 className={`w-full max-w-md ${
@@ -41,7 +50,7 @@ export function StepPanel({ step, align, accent = false }: StepPanelProps) {
                 }`}
             >
                 <div
-                    className={`inline-block rounded-2xl border border-black/10 bg-white/70 p-6 shadow-[0_1px_40px_rgba(0,0,0,0.04)] backdrop-blur-md sm:p-8 ${
+                    className={`inline-block rounded-2xl border border-black/10 bg-white/45 p-6 shadow-[0_1px_40px_rgba(0,0,0,0.04)] backdrop-blur-md sm:p-8 ${
                         align === "right" ? "text-right" : "text-left"
                     }`}
                 >
@@ -70,6 +79,7 @@ export function StepPanel({ step, align, accent = false }: StepPanelProps) {
                     </p>
                 </div>
             </motion.div>
+            </div>
         </section>
     );
 }
