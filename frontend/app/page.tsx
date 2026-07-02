@@ -47,9 +47,9 @@ function Experience() {
                                     "radial-gradient(60% 60% at 50% 45%, rgba(0,0,0,0.03) 0%, rgba(0,0,0,0) 70%)",
                             }}
                         />
-                        <div className="absolute inset-0 flex items-center justify-center">
+                        <div className="absolute inset-0">
                             <RotatingEarth
-                                className="h-full w-auto"
+                                className="h-full w-full"
                                 progress={scrollYProgress}
                                 focusMode
                                 sender={SENDER}

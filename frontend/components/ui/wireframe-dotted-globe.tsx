@@ -60,7 +60,8 @@ export default function RotatingEarth({
         let landFeatures: any = null
         const allDots: Coord[] = []
 
-        let size = 0
+        let vw = 0
+        let vh = 0
         let baseRadius = 0
         let frameCount = 0
         let rafId = 0
@@ -74,22 +75,26 @@ export default function RotatingEarth({
         const interp = d3.geoInterpolate(sender, recipient)
 
         const initGlobe = () => {
-            const { width, height } = container.getBoundingClientRect()
-            size = Math.min(width, height)
+            // Use the FULL container surface (not a square): while zooming the
+            // sphere grows past the base radius, and a square canvas would clip
+            // it at its edges (sides on desktop, top/bottom on mobile).
+            const rect = container.getBoundingClientRect()
+            vw = rect.width
+            vh = rect.height
 
             const dpr = window.devicePixelRatio || 1
-            canvas.width = size * dpr
-            canvas.height = size * dpr
-            canvas.style.width = `${size}px`
-            canvas.style.height = `${size}px`
+            canvas.width = vw * dpr
+            canvas.height = vh * dpr
+            canvas.style.width = `${vw}px`
+            canvas.style.height = `${vh}px`
             context.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-            baseRadius = size / 2.2
+            baseRadius = Math.min(vw, vh) / 2.2
 
             projection = d3
                 .geoOrthographic()
                 .scale(baseRadius)
-                .translate([size / 2, size / 2])
+                .translate([vw / 2, vh / 2])
                 .clipAngle(90)
 
             path = d3.geoPath().projection(projection).context(context)
@@ -99,7 +104,7 @@ export default function RotatingEarth({
             const scale = projection.scale()
             context.globalAlpha = alpha
             context.beginPath()
-            context.arc(size / 2, size / 2, scale, 0, 2 * Math.PI)
+            context.arc(vw / 2, vh / 2, scale, 0, 2 * Math.PI)
             context.fillStyle = "#ffffff"
             context.fill()
             context.strokeStyle = "#000000"
@@ -196,8 +201,8 @@ export default function RotatingEarth({
 
         // The travelling encrypted packet, always tracked at screen center.
         const drawPacket = (destructing: boolean) => {
-            const cx = size / 2
-            const cy = size / 2
+            const cx = vw / 2
+            const cy = vh / 2
             const pulse = (Math.sin(frameCount * 0.08) + 1) / 2 // 0..1
             const color = destructing ? "#ef4444" : "#000000"
 
@@ -224,7 +229,7 @@ export default function RotatingEarth({
         }
 
         const clear = () => {
-            context.clearRect(0, 0, size, size)
+            context.clearRect(0, 0, vw, vh)
         }
 
         // ---- Focus (scroll-driven camera) frame ----
@@ -291,7 +296,7 @@ export default function RotatingEarth({
             clear()
             const pulse = (Math.sin(frameCount * 0.05) + 1) / 2
             context.beginPath()
-            context.arc(size / 2, size / 2, baseRadius, 0, 2 * Math.PI)
+            context.arc(vw / 2, vh / 2, baseRadius, 0, 2 * Math.PI)
             context.strokeStyle = "#000000"
             context.globalAlpha = 0.15 + pulse * 0.2
             context.lineWidth = 1
@@ -478,7 +483,13 @@ export default function RotatingEarth({
         <div
             ref={containerRef}
             className={`w-full h-full flex items-center justify-center ${className}`}
-            style={{ minHeight: "300px", aspectRatio: "1/1" }}
+            style={
+                // In focus mode the canvas must cover the whole viewport so the
+                // zoomed sphere is never clipped; the legacy globe stays square.
+                focusMode
+                    ? { minHeight: "300px" }
+                    : { minHeight: "300px", aspectRatio: "1/1" }
+            }
         >
             <canvas ref={canvasRef} />
         </div>
