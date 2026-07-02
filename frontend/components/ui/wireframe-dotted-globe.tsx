@@ -1,18 +1,46 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
+import type { MotionValue } from "framer-motion"
 import * as d3 from "d3"
 
+type Coord = [number, number]
+
 interface RotatingEarthProps {
-    width?: number
-    height?: number
     className?: string
+    /** Scroll progress 0..1 that drives the camera (fly A -> B) and the zoom. */
+    progress?: MotionValue<number>
+    /** When true, the globe is a scroll-driven camera instead of a free auto-rotating globe. */
+    focusMode?: boolean
+    /** Journey origin [lng, lat] — where the note is encrypted. */
+    sender?: Coord
+    /** Journey destination [lng, lat] — where the note is read & destroyed. */
+    recipient?: Coord
+    /** Fires once the land data has loaded and the first real frame has drawn. */
+    onReady?: () => void
 }
 
-export default function RotatingEarth({ className = "" }: { className?: string }) {
+const smoothstep = (edge0: number, edge1: number, x: number) => {
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)))
+    return t * t * (3 - 2 * t)
+}
+
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t
+
+export default function RotatingEarth({
+    className = "",
+    progress,
+    focusMode = false,
+    sender = [2.3522, 48.8566], // Paris
+    recipient = [-74.006, 40.7128], // New York
+    onReady,
+}: RotatingEarthProps) {
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const containerRef = useRef<HTMLDivElement>(null)
     const [error, setError] = useState<string | null>(null)
+
+    // Keep the latest scroll value without forcing React re-renders on every frame.
+    const progressRef = useRef(0)
 
     useEffect(() => {
         if (!canvasRef.current || !containerRef.current) return
@@ -22,105 +50,290 @@ export default function RotatingEarth({ className = "" }: { className?: string }
         const context = canvas.getContext("2d")
         if (!context) return
 
-        let animationFrameId: number
+        const prefersReduced =
+            typeof window !== "undefined" &&
+            window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+
         let projection: d3.GeoProjection
         let path: d3.GeoPath
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let landFeatures: any
-        const allDots: { lng: number; lat: number }[] = []
+        let landFeatures: any = null
+        const allDots: Coord[] = []
 
-        // Rotation state
+        let size = 0
+        let baseRadius = 0
+        let frameCount = 0
+        let rafId = 0
+        let ready = false
+
+        // Legacy (non-focus) auto-rotate state
         const rotation: [number, number] = [0, 0]
         let autoRotate = true
-        const rotationSpeed = 0.5
-        let timer: d3.Timer | null = null
+        let idleAngle = 0
+
+        const interp = d3.geoInterpolate(sender, recipient)
 
         const initGlobe = () => {
-            // Get actual container dimensions
             const { width, height } = container.getBoundingClientRect()
-
-            // Make it square based on the smallest dimension to keep aspect ratio 1:1
-            // OR use the full available space but maintain projection aspect ratio
-            const size = Math.min(width, height)
+            size = Math.min(width, height)
 
             const dpr = window.devicePixelRatio || 1
             canvas.width = size * dpr
             canvas.height = size * dpr
             canvas.style.width = `${size}px`
             canvas.style.height = `${size}px`
-            context.scale(dpr, dpr)
+            context.setTransform(dpr, 0, 0, dpr, 0, 0)
 
-            const radius = size / 2.2 // Slightly smaller than full container
+            baseRadius = size / 2.2
 
             projection = d3
                 .geoOrthographic()
-                .scale(radius)
+                .scale(baseRadius)
                 .translate([size / 2, size / 2])
                 .clipAngle(90)
 
             path = d3.geoPath().projection(projection).context(context)
         }
 
-        const render = () => {
-            const width = canvas.width / (window.devicePixelRatio || 1)
-            const height = canvas.height / (window.devicePixelRatio || 1)
-
-            context.clearRect(0, 0, width, height)
-
-            if (!projection) return
-
-            const currentScale = projection.scale()
-            // Recalculate radius based on current scale needed vs initial radius
-            // But actually we just need relative scale for stroke width
-            // Let's approximate base radius
-            const baseRadius = width / 2.2
-            const scaleFactor = currentScale / baseRadius
-
-            // Draw ocean (globe background)
+        const drawSphere = (strokeScale: number, alpha: number) => {
+            const scale = projection.scale()
+            context.globalAlpha = alpha
             context.beginPath()
-            context.arc(width / 2, height / 2, currentScale, 0, 2 * Math.PI)
+            context.arc(size / 2, size / 2, scale, 0, 2 * Math.PI)
             context.fillStyle = "#ffffff"
             context.fill()
             context.strokeStyle = "#000000"
-            context.lineWidth = 1 * scaleFactor // Thinner line
+            context.lineWidth = 1 * strokeScale
+            context.stroke()
+            context.globalAlpha = 1
+        }
+
+        const drawLand = (strokeScale: number, alpha: number) => {
+            if (!landFeatures) return
+
+            // Graticule
+            const graticule = d3.geoGraticule()
+            context.beginPath()
+            path(graticule())
+            context.strokeStyle = "#000000"
+            context.lineWidth = 0.5 * strokeScale
+            context.globalAlpha = 0.08 * alpha
+            context.stroke()
+            context.globalAlpha = 1
+
+            // Land outlines
+            context.beginPath()
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            landFeatures.features.forEach((feature: any) => path(feature))
+            context.strokeStyle = "#000000"
+            context.lineWidth = 0.8 * strokeScale
+            context.globalAlpha = alpha
             context.stroke()
 
-            if (landFeatures) {
-                // Draw graticule
-                const graticule = d3.geoGraticule()
+            // Halftone dots
+            const dotR = Math.max(0.6, 1 * strokeScale)
+            context.fillStyle = "#000000"
+            allDots.forEach((dot) => {
+                const projected = projection(dot)
+                if (projected) {
+                    context.beginPath()
+                    context.arc(projected[0], projected[1], dotR, 0, 2 * Math.PI)
+                    context.fill()
+                }
+            })
+            context.globalAlpha = 1
+        }
+
+        // Draw a great-circle segment between two coords (t0..t1 of the interpolator).
+        const drawArcSegment = (
+            t0: number,
+            t1: number,
+            color: string,
+            width: number,
+            alpha: number,
+        ) => {
+            if (t1 <= t0) return
+            const steps = 64
+            const coordinates: Coord[] = []
+            for (let i = 0; i <= steps; i++) {
+                const t = t0 + ((t1 - t0) * i) / steps
+                coordinates.push(interp(t) as Coord)
+            }
+            context.beginPath()
+            path({ type: "LineString", coordinates })
+            context.strokeStyle = color
+            context.lineWidth = width
+            context.globalAlpha = alpha
+            context.stroke()
+            context.globalAlpha = 1
+        }
+
+        const drawNode = (
+            coord: Coord,
+            center: Coord,
+            radius: number,
+            color: string,
+            pulse: number,
+        ) => {
+            // Only draw when on the visible hemisphere.
+            if (d3.geoDistance(coord, center) > Math.PI / 2) return
+            const p = projection(coord)
+            if (!p) return
+            context.beginPath()
+            context.arc(p[0], p[1], radius, 0, 2 * Math.PI)
+            context.fillStyle = color
+            context.fill()
+            if (pulse > 0) {
                 context.beginPath()
-                path(graticule())
-                context.strokeStyle = "#000000"
-                context.lineWidth = 0.5 * scaleFactor
-                context.globalAlpha = 0.1
+                context.arc(p[0], p[1], radius + pulse * 10, 0, 2 * Math.PI)
+                context.strokeStyle = color
+                context.globalAlpha = Math.max(0, 1 - pulse)
+                context.lineWidth = 1.5
                 context.stroke()
                 context.globalAlpha = 1
-
-                // Draw land outlines
-                context.beginPath()
-                landFeatures.features.forEach((feature: any) => {
-                    path(feature)
-                })
-                context.strokeStyle = "#000000"
-                context.lineWidth = 0.8 * scaleFactor
-                context.stroke()
-
-                // Draw halftone dots
-                allDots.forEach((dot) => {
-                    const projected = projection([dot.lng, dot.lat])
-                    if (projected) {
-                        // Check visibility (clip angle handles mostly backend, but manual check ensures)
-                        // d3 geoOrthographic clipAngle(90) should handle visibility, but let's trust d3
-                        context.beginPath()
-                        context.arc(projected[0], projected[1], 1 * scaleFactor, 0, 2 * Math.PI)
-                        context.fillStyle = "#000000"
-                        context.fill()
-                    }
-                })
             }
         }
 
-        const pointInPolygon = (point: [number, number], polygon: number[][]): boolean => {
+        // The travelling encrypted packet, always tracked at screen center.
+        const drawPacket = (destructing: boolean) => {
+            const cx = size / 2
+            const cy = size / 2
+            const pulse = (Math.sin(frameCount * 0.08) + 1) / 2 // 0..1
+            const color = destructing ? "#ef4444" : "#000000"
+
+            // Halo
+            context.beginPath()
+            context.arc(cx, cy, 10 + pulse * 6, 0, 2 * Math.PI)
+            context.strokeStyle = color
+            context.globalAlpha = 0.25 + pulse * 0.25
+            context.lineWidth = 1.5
+            context.stroke()
+            context.globalAlpha = 1
+
+            // Core dot
+            context.beginPath()
+            context.arc(cx, cy, 5, 0, 2 * Math.PI)
+            context.fillStyle = color
+            context.fill()
+
+            // Tiny lock notch (a small white bite) to read as "secured"
+            context.beginPath()
+            context.arc(cx, cy - 1.5, 2, 0, 2 * Math.PI)
+            context.fillStyle = "#ffffff"
+            context.fill()
+        }
+
+        const clear = () => {
+            context.clearRect(0, 0, size, size)
+        }
+
+        // ---- Focus (scroll-driven camera) frame ----
+        const focusFrame = () => {
+            if (!projection) return
+            frameCount++
+            const p = prefersReduced ? progressRef.current : progressRef.current
+
+            clear()
+
+            // Camera travels A -> B along the great circle.
+            const camT = smoothstep(0.25, 0.85, p)
+            const center = interp(camT) as Coord
+
+            // Blend from an idle-facing view into the locked camera at the very start.
+            const focusBlend = smoothstep(0, 0.12, p)
+            if (!prefersReduced) idleAngle += 0.12
+            const lng = lerp(idleAngle, -center[0], focusBlend)
+            const lat = lerp(-12, -center[1], focusBlend)
+            projection.rotate([lng, lat, 0])
+
+            // Zoom: ease in onto A, hold through travel, settle onto B.
+            const zoomIn = smoothstep(0.1, 0.28, p)
+            const settle = smoothstep(0.82, 0.96, p)
+            const zoom = 1 + zoomIn * 1.5 + settle * 0.4
+            projection.scale(baseRadius * zoom)
+
+            const strokeScale = Math.min(1.6, Math.sqrt(zoom))
+            const globeAlpha = 1 - smoothstep(0.9, 1, p) * 0.25
+
+            drawSphere(strokeScale, globeAlpha)
+            drawLand(strokeScale, globeAlpha)
+
+            // The journey path (only once we've begun to travel).
+            const arcVisible = smoothstep(0.18, 0.3, p)
+            if (arcVisible > 0 && landFeatures) {
+                drawArcSegment(0, 1, "#000000", 1, 0.12 * arcVisible) // faint full path
+                drawArcSegment(0, camT, "#000000", 1.5, 0.9 * arcVisible) // travelled, bright
+
+                const destructing = p > 0.9
+                // Origin node (sender)
+                drawNode(sender, center, 4, "#000000", 0)
+                // Destination node (recipient) — pulses red as the note is destroyed
+                drawNode(
+                    recipient,
+                    center,
+                    4,
+                    destructing ? "#ef4444" : "#000000",
+                    destructing ? (Math.sin(frameCount * 0.1) + 1) / 2 : 0,
+                )
+
+                if (p > 0.22) drawPacket(destructing)
+            }
+
+            if (!ready && landFeatures) {
+                ready = true
+                onReady?.()
+            }
+        }
+
+        // ---- Loading placeholder (pulsing wireframe ring) ----
+        const drawPlaceholder = () => {
+            frameCount++
+            clear()
+            const pulse = (Math.sin(frameCount * 0.05) + 1) / 2
+            context.beginPath()
+            context.arc(size / 2, size / 2, baseRadius, 0, 2 * Math.PI)
+            context.strokeStyle = "#000000"
+            context.globalAlpha = 0.15 + pulse * 0.2
+            context.lineWidth = 1
+            context.stroke()
+            context.globalAlpha = 1
+        }
+
+        // ---- Legacy free-spinning globe (non-focus usages) ----
+        const legacyRender = () => {
+            if (!projection) return
+            clear()
+            const strokeScale = 1
+            drawSphere(strokeScale, 1)
+            drawLand(strokeScale, 1)
+            if (!ready && landFeatures) {
+                ready = true
+                onReady?.()
+            }
+        }
+
+        // ---- Animation loops ----
+        const focusLoop = () => {
+            if (landFeatures || !focusMode) {
+                landFeatures ? focusFrame() : drawPlaceholder()
+            } else {
+                drawPlaceholder()
+            }
+            rafId = requestAnimationFrame(focusLoop)
+        }
+
+        let legacyTimer: d3.Timer | null = null
+        const legacyRotate = () => {
+            if (autoRotate && projection) {
+                rotation[0] += 0.5
+                ;(projection as d3.GeoProjection).rotate(rotation)
+                legacyRender()
+                legacyTimer = d3.timeout(legacyRotate, 20)
+            }
+        }
+
+        // ---- Point-in-polygon dot generation (land only) ----
+        const pointInPolygon = (point: Coord, polygon: number[][]): boolean => {
             const [x, y] = point
             let inside = false
             for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
@@ -134,13 +347,13 @@ export default function RotatingEarth({ className = "" }: { className?: string }
         }
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const pointInFeature = (point: [number, number], feature: any): boolean => {
+        const pointInFeature = (point: Coord, feature: any): boolean => {
             const geometry = feature.geometry
             if (geometry.type === "Polygon") {
-                const coordinates = geometry.coordinates
-                if (!pointInPolygon(point, coordinates[0])) return false
-                for (let i = 1; i < coordinates.length; i++) {
-                    if (pointInPolygon(point, coordinates[i])) return false
+                const c = geometry.coordinates
+                if (!pointInPolygon(point, c[0])) return false
+                for (let i = 1; i < c.length; i++) {
+                    if (pointInPolygon(point, c[i])) return false
                 }
                 return true
             } else if (geometry.type === "MultiPolygon") {
@@ -162,157 +375,100 @@ export default function RotatingEarth({ className = "" }: { className?: string }
         }
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const generateDotsInPolygon = (feature: any, dotSpacing = 12) => {
-            const stepSize = dotSpacing * 0.15 // Sparse dots
+        const generateDotsInPolygon = (feature: any, dotSpacing = 16) => {
+            const stepSize = dotSpacing * 0.15
             const bounds = d3.geoBounds(feature)
             const [[minLng, minLat], [maxLng, maxLat]] = bounds
-
             for (let lng = minLng; lng <= maxLng; lng += stepSize) {
                 for (let lat = minLat; lat <= maxLat; lat += stepSize) {
-                    const point: [number, number] = [lng, lat]
-                    if (pointInFeature(point, feature)) {
-                        allDots.push({ lng, lat })
-                    }
+                    const point: Coord = [lng, lat]
+                    if (pointInFeature(point, feature)) allDots.push(point)
                 }
             }
         }
 
         const loadWorldData = async () => {
             try {
-                const response = await fetch(
-                    "https://raw.githubusercontent.com/martynafford/natural-earth-geojson/refs/heads/master/110m/physical/ne_110m_land.json",
-                )
+                let response = await fetch("/geo/ne_110m_land.json")
+                if (!response.ok) {
+                    // Fallback to the upstream source if the local copy is missing.
+                    response = await fetch(
+                        "https://raw.githubusercontent.com/martynafford/natural-earth-geojson/refs/heads/master/110m/physical/ne_110m_land.json",
+                    )
+                }
                 if (!response.ok) throw new Error("Failed to load land data")
-
                 landFeatures = await response.json()
-
-                // Generate dots
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                landFeatures.features.forEach((feature: any) => {
-                    generateDotsInPolygon(feature, 16)
-                })
-
-                render()
-            } catch (err) {
+                landFeatures.features.forEach((feature: any) => generateDotsInPolygon(feature, 16))
+            } catch {
                 setError("Failed to load land map data")
             }
         }
 
-        const rotate = () => {
-            if (autoRotate && projection) {
-                rotation[0] += rotationSpeed;
-                (projection as any).rotate(rotation)
-                render()
-                timer = d3.timeout(rotate, 20) // Use d3 timeout/interval loop
-            }
-        }
-
-        const startRotation = () => {
-            if (timer) timer.stop()
-            rotate()
-        }
-
-        // Initial setup
+        // ---- Setup ----
         initGlobe()
-        loadWorldData().then(() => {
-            startRotation()
-        })
 
-        // Resize observer
+        // Seed the scroll value immediately so the first frame is correct.
+        if (progress) progressRef.current = progress.get()
+        const unsubscribe = progress
+            ? progress.on("change", (v) => {
+                  progressRef.current = v
+              })
+            : undefined
+
         const resizeObserver = new ResizeObserver(() => {
             initGlobe()
-            render()
+            if (!focusMode) legacyRender()
         })
         resizeObserver.observe(container)
 
+        if (focusMode) {
+            focusLoop()
+            loadWorldData()
+        } else {
+            loadWorldData().then(() => {
+                legacyRender()
+                legacyRotate()
+            })
+        }
 
-        // Interaction
+        // ---- Drag interaction (legacy free globe only) ----
         const handleMouseDown = (event: MouseEvent) => {
             autoRotate = false
-            if (timer) timer.stop()
-
+            if (legacyTimer) legacyTimer.stop()
             const startX = event.clientX
             const startY = event.clientY
-            const initialRotation = [...rotation]
-
-            const handleMouseMove = (moveEvent: MouseEvent) => {
-                const sensitivity = 0.5
-                const dx = moveEvent.clientX - startX
-                const dy = moveEvent.clientY - startY
-
-                rotation[0] = initialRotation[0] + dx * sensitivity
-                rotation[1] = initialRotation[1] - dy * sensitivity
-                rotation[1] = Math.max(-90, Math.min(90, rotation[1]))
-
-                if (projection) {
-                    (projection as any).rotate(rotation as [number, number])
-                    render()
-                }
+            const initial = [...rotation]
+            const move = (e: MouseEvent) => {
+                const s = 0.5
+                rotation[0] = initial[0] + (e.clientX - startX) * s
+                rotation[1] = Math.max(-90, Math.min(90, initial[1] - (e.clientY - startY) * s))
+                ;(projection as d3.GeoProjection).rotate(rotation)
+                legacyRender()
             }
-
-            const handleMouseUp = () => {
-                document.removeEventListener("mousemove", handleMouseMove)
-                document.removeEventListener("mouseup", handleMouseUp)
+            const up = () => {
+                document.removeEventListener("mousemove", move)
+                document.removeEventListener("mouseup", up)
                 setTimeout(() => {
                     autoRotate = true
-                    startRotation()
+                    legacyRotate()
                 }, 100)
             }
-
-            document.addEventListener("mousemove", handleMouseMove)
-            document.addEventListener("mouseup", handleMouseUp)
+            document.addEventListener("mousemove", move)
+            document.addEventListener("mouseup", up)
         }
 
-        // Touch support for mobile
-        const handleTouchStart = (event: TouchEvent) => {
-            autoRotate = false
-            if (timer) timer.stop()
-
-            const touch = event.touches[0]
-            const startX = touch.clientX
-            const startY = touch.clientY
-            const initialRotation = [...rotation]
-
-            const handleTouchMove = (moveEvent: TouchEvent) => {
-                const moveTouch = moveEvent.touches[0]
-                const sensitivity = 0.5
-                const dx = moveTouch.clientX - startX
-                const dy = moveTouch.clientY - startY
-
-                rotation[0] = initialRotation[0] + dx * sensitivity
-                rotation[1] = initialRotation[1] - dy * sensitivity
-                rotation[1] = Math.max(-90, Math.min(90, rotation[1]))
-
-                if (projection) {
-                    (projection as any).rotate(rotation as [number, number])
-                    render()
-                }
-            }
-
-            const handleTouchEnd = () => {
-                document.removeEventListener("touchmove", handleTouchMove)
-                document.removeEventListener("touchend", handleTouchEnd)
-                setTimeout(() => {
-                    autoRotate = true
-                    startRotation()
-                }, 100)
-            }
-
-            document.addEventListener("touchmove", handleTouchMove)
-            document.addEventListener("touchend", handleTouchEnd)
-        }
-
-
-        canvas.addEventListener("mousedown", handleMouseDown)
-        canvas.addEventListener("touchstart", handleTouchStart)
+        if (!focusMode) canvas.addEventListener("mousedown", handleMouseDown)
 
         return () => {
-            if (timer) timer.stop()
+            if (rafId) cancelAnimationFrame(rafId)
+            if (legacyTimer) legacyTimer.stop()
+            unsubscribe?.()
             resizeObserver.disconnect()
             canvas.removeEventListener("mousedown", handleMouseDown)
-            canvas.removeEventListener("touchstart", handleTouchStart)
         }
-    }, [])
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [focusMode])
 
     if (error) {
         return <div className="text-red-500 text-xs p-4">{error}</div>
@@ -322,10 +478,7 @@ export default function RotatingEarth({ className = "" }: { className?: string }
         <div
             ref={containerRef}
             className={`w-full h-full flex items-center justify-center ${className}`}
-            style={{
-                minHeight: '300px',
-                aspectRatio: '1/1' // Important to force aspect ratio
-            }}
+            style={{ minHeight: "300px", aspectRatio: "1/1" }}
         >
             <canvas ref={canvasRef} />
         </div>
